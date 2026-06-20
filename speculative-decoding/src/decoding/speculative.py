@@ -11,6 +11,7 @@ Repeats until EOS.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import torch
@@ -25,12 +26,35 @@ from ..models.wrapper import LanguageModel
 
 @dataclass
 class DecodeStats:
-    """Counters for a single speculative-decoding run."""
+    """Counters and metrics for a single speculative-decoding run."""
 
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     rejected_tokens: int = 0
+    draft_calls: int = 0
     target_calls: int = 0
+    generation_time: float = 0.0
+
+    @property
+    def acceptance_rate(self) -> float:
+        """Fraction of drafted tokens that were accepted (0.0 to 1.0)."""
+        if self.drafted_tokens == 0:
+            return 0.0
+        return self.accepted_tokens / self.drafted_tokens
+
+    @property
+    def rejection_rate(self) -> float:
+        """Fraction of drafted tokens that were rejected (0.0 to 1.0)."""
+        if self.drafted_tokens == 0:
+            return 0.0
+        return self.rejected_tokens / self.drafted_tokens
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Tokens generated per second (including prompt)."""
+        if self.generation_time == 0:
+            return 0.0
+        return (self.accepted_tokens + self.rejected_tokens) / self.generation_time
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +430,7 @@ class SpeculativeDecoder:
 
         total_generated = 0
         hit_eos = False
+        start_time = time.perf_counter()
 
         while total_generated < max_new_tokens and not hit_eos:
             # 1. Draft
@@ -414,6 +439,7 @@ class SpeculativeDecoder:
             )
             num_drafted = drafted_ids.shape[1]
             stats.drafted_tokens += num_drafted
+            stats.draft_calls += 1
 
             # 2. Verify (one target call per round)
             target_probs, target_ids = self.verify_step(
@@ -443,6 +469,8 @@ class SpeculativeDecoder:
                     hit_eos = True
 
             self._log("-" * 40)
+
+        stats.generation_time = time.perf_counter() - start_time
 
         # Decode final sequence
         decoded_text: str = self.draft_model.decode(input_ids)

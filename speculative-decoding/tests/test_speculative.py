@@ -69,22 +69,37 @@ def test_stats_are_consistent():
     assert stats.drafted_tokens >= 0, f"Negative drafted: {stats.drafted_tokens}"
     assert stats.accepted_tokens >= 0, f"Negative accepted: {stats.accepted_tokens}"
     assert stats.rejected_tokens >= 0, f"Negative rejected: {stats.rejected_tokens}"
+    assert stats.draft_calls >= 0, f"Negative draft_calls: {stats.draft_calls}"
     assert stats.target_calls >= 0, f"Negative target_calls: {stats.target_calls}"
+    assert stats.generation_time >= 0, f"Negative generation_time: {stats.generation_time}"
 
     # drafted = accepted + rejected
     assert stats.drafted_tokens == stats.accepted_tokens + stats.rejected_tokens, (
         f"Drafted ({stats.drafted_tokens}) != accepted ({stats.accepted_tokens}) + rejected ({stats.rejected_tokens})"
     )
 
-    # At least one target call
+    # draft_calls == target_calls (each round has one of each, bonus adds to target)
+    assert stats.draft_calls <= stats.target_calls, (
+        f"draft_calls ({stats.draft_calls}) > target_calls ({stats.target_calls})"
+    )
+
+    # At least one call
+    assert stats.draft_calls > 0, "No draft model calls made"
     assert stats.target_calls > 0, "No target model calls made"
 
-    # Target calls should be >= ceil(drafted / k) since each round uses one target call
-    # Plus bonus calls when all drafts accepted
+    # Rates should sum to 1.0 (within floating point)
+    assert abs(stats.acceptance_rate + stats.rejection_rate - 1.0) < 1e-6, (
+        f"Rates don't sum to 1: {stats.acceptance_rate} + {stats.rejection_rate}"
+    )
+
     print(f"Drafted: {stats.drafted_tokens}")
     print(f"Accepted: {stats.accepted_tokens}")
     print(f"Rejected: {stats.rejected_tokens}")
+    print(f"Draft calls: {stats.draft_calls}")
     print(f"Target calls: {stats.target_calls}")
+    print(f"Acceptance rate: {stats.acceptance_rate:.1%}")
+    print(f"Rejection rate: {stats.rejection_rate:.1%}")
+    print(f"Generation time: {stats.generation_time:.3f}s")
     print()
 
 
