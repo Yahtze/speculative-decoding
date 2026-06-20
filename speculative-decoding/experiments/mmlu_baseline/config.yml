@@ -1,0 +1,27 @@
+# MMLU Baseline Experiment (Greedy Decoding, No Speculative Decoding)
+# Run with: python experiments/mmlu_baseline/run_mmlu_baseline.py
+
+experiment:
+  name: "mmlu_baseline_greedy"
+  description: "Baseline: target model with standard greedy decoding on MMLU"
+
+# MMLU dataset settings
+mmlu:
+  dataset: "cais/mmlu"
+  task: "anatomy"
+  max_questions: null  # null = all
+
+# Model configuration (only target model, no draft)
+models:
+  target:
+    name: "HuggingFaceTB/SmolLM2-1.7B"
+
+# Decoding parameters
+decoding:
+  max_new_tokens: 256
+
+# Output settings
+output:
+  results_dir: "results/mmlu_baseline"  # Sub-dir for this experiment
+  save_name: "mmlu_baseline_anatomy"  # Overridden by task name
+  print_progress: true
