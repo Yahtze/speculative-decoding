@@ -10,19 +10,27 @@ Usage:
         target_model=LanguageModel("HuggingFaceTB/SmolLM2-1.7B"),
         k=3,
         prompts=prompts,
+        save_name="experiment_001",  # saves to results/experiment_001.json + .csv
     )
 """
 
 from __future__ import annotations
 
+import csv
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from ..models.wrapper import LanguageModel
 from ..decoding.speculative import SpeculativeDecoder, DecodeStats
+
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +190,8 @@ def run_experiment(
     top_k: int = 50,
     verbose: bool = False,
     progress_fn: Optional[Callable[[int, int], None]] = None,
+    save_name: Optional[str] = None,
+    results_dir: str | Path = RESULTS_DIR,
 ) -> ExperimentResult:
     """
     Run speculative decoding across a batch of prompts.
@@ -196,6 +206,8 @@ def run_experiment(
         top_k: Top-k filtering parameter.
         verbose: Print per-token logs for each prompt.
         progress_fn: Optional callback(current, total) for progress updates.
+        save_name: If set, save results to {results_dir}/{save_name}.json and .csv.
+        results_dir: Directory to save results. Defaults to speculative-decoding/results/.
 
     Returns:
         ExperimentResult with aggregated metrics.
@@ -252,15 +264,21 @@ def run_experiment(
         result.latency = result.total_generation_time / result.total_prompts
         result.target_calls = result.total_target_calls / result.total_prompts
 
+    # Auto-save if save_name provided
+    if save_name:
+        save_dir = Path(results_dir)
+        save_result_json(result, save_dir / f"{save_name}.json")
+        save_result_csv(result, save_dir / f"{save_name}.csv")
+
     return result
 
 
 # ---------------------------------------------------------------------------
-# Convenience: save/load results
+# Save results
 # ---------------------------------------------------------------------------
 
 
-def save_result(result: ExperimentResult, path: str | Path) -> None:
+def save_result_json(result: ExperimentResult, path: str | Path) -> None:
     """Save experiment result to JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,6 +325,47 @@ def save_result(result: ExperimentResult, path: str | Path) -> None:
 
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def save_result_csv(result: ExperimentResult, path: str | Path) -> None:
+    """Save per-prompt results to CSV."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames = [
+        "prompt",
+        "output",
+        "drafted_tokens",
+        "accepted_tokens",
+        "rejected_tokens",
+        "acceptance_rate",
+        "draft_calls",
+        "target_calls",
+        "generation_time",
+    ]
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for pr in result.prompt_results:
+            writer.writerow({
+                "prompt": pr.prompt,
+                "output": pr.output,
+                "drafted_tokens": pr.stats.drafted_tokens,
+                "accepted_tokens": pr.stats.accepted_tokens,
+                "rejected_tokens": pr.stats.rejected_tokens,
+                "acceptance_rate": f"{pr.stats.acceptance_rate:.4f}",
+                "draft_calls": pr.stats.draft_calls,
+                "target_calls": pr.stats.target_calls,
+                "generation_time": f"{pr.stats.generation_time:.4f}",
+            })
+
+
+# Backward-compatible alias
+def save_result(result: ExperimentResult, path: str | Path) -> None:
+    """Save experiment result to JSON (backward-compatible alias)."""
+    save_result_json(result, path)
 
 
 def progress_printer(current: int, total: int) -> None:

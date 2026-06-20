@@ -122,6 +122,15 @@ class SpeculativeDecoder:
         mask = logits < threshold
         logits[mask] = float("-inf")
 
+        # Greedy mode: argmax instead of sampling
+        if self.temperature == 0.0:
+            next_token = logits.argmax(dim=-1, keepdim=True)  # (1, 1)
+            # One-hot probability for greedy token
+            probs = torch.zeros_like(logits)
+            probs[0, next_token.item()] = 1.0
+            token_prob = probs[0, next_token.item()]
+            return next_token, token_prob
+
         # Scale and convert to probabilities
         scaled = logits / self.temperature
         probs = torch.softmax(scaled, dim=-1)  # (1, vocab_size)
@@ -143,6 +152,13 @@ class SpeculativeDecoder:
         """
         output = model.forward(input_ids)
         logits = output.logits[:, -1, :]  # (1, vocab_size)
+
+        # Greedy mode: one-hot on argmax
+        if self.temperature == 0.0:
+            probs = torch.zeros_like(logits)
+            probs[0, logits.argmax(dim=-1)] = 1.0
+            return probs
+
         scaled = logits / self.temperature
         probs = torch.softmax(scaled, dim=-1)
         return probs
@@ -234,10 +250,22 @@ class SpeculativeDecoder:
         for i in range(num_drafted):
             pos = original_len + i - 1  # logits at pos predict token at pos+1
             pos_logits = logits[:, pos, :]  # (1, vocab_size)
+
+            draft_tok = drafted_ids[0, i].item()
+
+            # Greedy mode: one-hot on argmax
+            if self.temperature == 0.0:
+                probs = torch.zeros_like(pos_logits)
+                argmax_tok = pos_logits.argmax(dim=-1, keepdim=True)
+                probs[0, argmax_tok.item()] = 1.0
+                target_prob = probs[0, draft_tok]
+                target_probs.append(target_prob)
+                target_token_ids.append(argmax_tok)
+                continue
+
             scaled = pos_logits / self.temperature
             probs = torch.softmax(scaled, dim=-1)  # (1, vocab_size)
 
-            draft_tok = drafted_ids[0, i].item()
             target_prob = probs[0, draft_tok]  # p(x) for the draft token
             target_probs.append(target_prob)
 

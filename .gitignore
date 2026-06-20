@@ -12,3 +12,6 @@ wheels/
 # Virtual environments
 .venv
 scratchpad/
+
+# Experiment results
+speculative-decoding/results/
