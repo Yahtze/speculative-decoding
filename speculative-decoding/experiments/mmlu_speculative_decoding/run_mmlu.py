@@ -16,6 +16,7 @@ Usage:
 import sys
 import argparse
 from pathlib import Path
+import time
 
 # Add project src to path
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -154,6 +155,16 @@ def load_config(config_path: Path) -> dict:
         return yaml.safe_load(f)
 
 
+def timed_step(label: str, fn):
+    """Run fn(), print elapsed time, return fn result."""
+    print(f"\n[{label}] start")
+    start = time.perf_counter()
+    value = fn()
+    elapsed = time.perf_counter() - start
+    print(f"[{label}] done in {elapsed:.2f}s")
+    return value, elapsed
+
+
 def main():
     parser = argparse.ArgumentParser(description="MMLU Speculative Decoding Experiment")
     parser.add_argument(
@@ -234,44 +245,77 @@ def main():
     print("=" * 60)
     
     # Load MMLU prompts
-    prompts, answer_indices = load_mmlu_prompts(
-        task=task,
-        dataset_name=config["mmlu"]["dataset"],
-        max_questions=max_questions,
+    (prompts, answer_indices), dataset_time = timed_step(
+        "dataset load + prompt formatting",
+        lambda: load_mmlu_prompts(
+            task=task,
+            dataset_name=config["mmlu"]["dataset"],
+            max_questions=max_questions,
+        ),
     )
-    
-    # Load models
+
+    # Load models once, outside prompt loop
     print(f"\nLoading draft model: {draft_model_name}")
-    draft_model = LanguageModel(draft_model_name)
-    
+    draft_model, draft_model_load_time = timed_step(
+        "draft model load",
+        lambda: LanguageModel(draft_model_name),
+    )
+
     print(f"Loading target model: {target_model_name}")
-    target_model = LanguageModel(target_model_name)
-    
+    target_model, target_model_load_time = timed_step(
+        "target model load",
+        lambda: LanguageModel(target_model_name),
+    )
+
     # Run experiment
     print(f"\nRunning speculative decoding on {len(prompts)} questions...")
-    
-    result = run_experiment(
-        draft_model=draft_model,
-        target_model=target_model,
-        k=k,
-        prompts=prompts,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        verbose=verbose,
-        progress_fn=progress_printer if config["output"].get("print_progress", True) else None,
-        save_name=save_name,
-        results_dir=results_dir,
+
+    result, experiment_time = timed_step(
+        "experiment run",
+        lambda: run_experiment(
+            draft_model=draft_model,
+            target_model=target_model,
+            k=k,
+            prompts=prompts,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            verbose=verbose,
+            progress_fn=progress_printer if config["output"].get("print_progress", True) else None,
+            timing_progress=True,
+            save_name=save_name,
+            results_dir=results_dir,
+        ),
     )
-    
+
     # Evaluate accuracy
-    accuracy_metrics = evaluate_accuracy(result.prompt_results, answer_indices, prompts)
+    accuracy_metrics, accuracy_eval_time = timed_step(
+        "accuracy evaluation",
+        lambda: evaluate_accuracy(result.prompt_results, answer_indices, prompts),
+    )
+
+    result.runtime_timings = {
+        "dataset_load_time": dataset_time,
+        "draft_model_load_time": draft_model_load_time,
+        "target_model_load_time": target_model_load_time,
+        "experiment_wall_time": experiment_time,
+        "accuracy_eval_time": accuracy_eval_time,
+    }
+    save_result_json(result, results_dir / f"{save_name}.json")
     
     # Print summary
     print("\n" + "=" * 60)
     print("EXPERIMENT RESULTS")
     print("=" * 60)
     print(result.summary())
+    print("-" * 60)
+    print("Timing breakdown outside generation loop:")
+    print(f"  Dataset load + prompt formatting: {dataset_time:.2f}s")
+    print(f"  Draft model load (once):         {draft_model_load_time:.2f}s")
+    print(f"  Target model load (once):        {target_model_load_time:.2f}s")
+    print(f"  Experiment loop wall time:       {experiment_time:.2f}s")
+    print(f"  Accuracy evaluation:             {accuracy_eval_time:.2f}s")
+    print("  Model reloads between samples:   no (models constructed once before loop)")
     print("-" * 60)
     print(f"Accuracy:         {accuracy_metrics['accuracy']:.1%}")
     print(f"Valid format:     {accuracy_metrics['valid_format_rate']:.1%}")
@@ -300,6 +344,7 @@ def main():
                 "throughput": result.throughput,
                 "latency": result.latency,
             },
+            "runtime_timings": result.runtime_timings,
         }, f, indent=2)
     
     print(f"\nResults saved to:")

@@ -33,7 +33,14 @@ class DecodeStats:
     rejected_tokens: int = 0
     draft_calls: int = 0
     target_calls: int = 0
+    tokenization_time: float = 0.0
     generation_time: float = 0.0
+    decode_time: float = 0.0
+
+    @property
+    def total_time(self) -> float:
+        """End-to-end time for one prompt."""
+        return self.tokenization_time + self.generation_time + self.decode_time
 
     @property
     def acceptance_rate(self) -> float:
@@ -450,7 +457,9 @@ class SpeculativeDecoder:
         eos_token_id = self.draft_model.tokenizer.eos_token_id
 
         # Encode prompt (use draft model's tokenizer — both should share vocab)
+        tokenization_start = time.perf_counter()
         input_ids = self.draft_model.encode(prompt)  # (1, seq_len)
+        stats.tokenization_time = time.perf_counter() - tokenization_start
         original_len = input_ids.shape[1]
 
         self._log(f"PROMPT:   {prompt!r}")
@@ -501,7 +510,9 @@ class SpeculativeDecoder:
         stats.generation_time = time.perf_counter() - start_time
 
         # Decode final sequence
+        decode_start = time.perf_counter()
         decoded_text: str = self.draft_model.decode(input_ids)
+        stats.decode_time = time.perf_counter() - decode_start
         if isinstance(decoded_text, list):
             decoded_text = decoded_text[0]
 

@@ -20,7 +20,13 @@ import csv
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 from typing import Callable, Optional
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - fallback when tqdm missing
+    tqdm = None
 
 from ..models.wrapper import LanguageModel
 from ..decoding.speculative import SpeculativeDecoder, DecodeStats
@@ -64,7 +70,9 @@ class ExperimentResult:
     total_drafted_tokens: int = 0
     total_accepted_tokens: int = 0
     total_rejected_tokens: int = 0
+    total_tokenization_time: float = 0.0
     total_generation_time: float = 0.0
+    total_decode_time: float = 0.0
     total_tokens_generated: int = 0
 
     # Per-prompt results
@@ -75,6 +83,9 @@ class ExperimentResult:
     target_model_name: str = ""
     k: int = 0
     max_new_tokens: int = 0
+
+    # Runtime timings outside prompt loop
+    runtime_timings: dict[str, float] = field(default_factory=dict)
 
     @property
     def rejection_rate(self) -> float:
@@ -89,6 +100,43 @@ class ExperimentResult:
         if self.total_target_calls == 0:
             return 0.0
         return self.total_tokens_generated / self.total_target_calls
+
+    @property
+    def total_prompt_time(self) -> float:
+        """End-to-end time across all prompts."""
+        return (
+            self.total_tokenization_time
+            + self.total_generation_time
+            + self.total_decode_time
+        )
+
+    @property
+    def avg_tokenization_time(self) -> float:
+        """Average tokenization time per prompt."""
+        if self.total_prompts == 0:
+            return 0.0
+        return self.total_tokenization_time / self.total_prompts
+
+    @property
+    def avg_generation_time(self) -> float:
+        """Average inference/generation time per prompt."""
+        if self.total_prompts == 0:
+            return 0.0
+        return self.total_generation_time / self.total_prompts
+
+    @property
+    def avg_decode_time(self) -> float:
+        """Average decode-to-text time per prompt."""
+        if self.total_prompts == 0:
+            return 0.0
+        return self.total_decode_time / self.total_prompts
+
+    @property
+    def avg_prompt_time(self) -> float:
+        """Average end-to-end time per prompt."""
+        if self.total_prompts == 0:
+            return 0.0
+        return self.total_prompt_time / self.total_prompts
 
     def summary(self) -> str:
         """Human-readable summary."""
@@ -105,6 +153,10 @@ class ExperimentResult:
             f"Rejection rate:  {self.rejection_rate:.1%}\n"
             f"Throughput:      {self.throughput:.2f} tokens/s\n"
             f"Latency:         {self.latency:.3f} s/prompt\n"
+            f"Avg tokenization:{self.avg_tokenization_time:.3f} s/prompt\n"
+            f"Avg inference:   {self.avg_generation_time:.3f} s/prompt\n"
+            f"Avg decode:      {self.avg_decode_time:.3f} s/prompt\n"
+            f"Avg total/prompt:{self.avg_prompt_time:.3f} s/prompt\n"
             f"Target calls:    {self.target_calls:.1f} avg/prompt\n"
             f"Tokens/call:     {self.tokens_per_target_call:.2f}\n"
             f"{'-' * 40}\n"
@@ -113,7 +165,10 @@ class ExperimentResult:
             f"Total rejected:  {self.total_rejected_tokens}\n"
             f"Total draft calls:  {self.total_draft_calls}\n"
             f"Total target calls: {self.total_target_calls}\n"
-            f"Total time:      {self.total_generation_time:.2f}s\n"
+            f"Total tokenization: {self.total_tokenization_time:.2f}s\n"
+            f"Total inference: {self.total_generation_time:.2f}s\n"
+            f"Total decode:    {self.total_decode_time:.2f}s\n"
+            f"Total time:      {self.total_prompt_time:.2f}s\n"
             f"Total tokens:    {self.total_tokens_generated}\n"
         )
 
@@ -190,6 +245,7 @@ def run_experiment(
     top_k: int = 50,
     verbose: bool = False,
     progress_fn: Optional[Callable[[int, int], None]] = None,
+    timing_progress: bool = False,
     save_name: Optional[str] = None,
     results_dir: str | Path = RESULTS_DIR,
 ) -> ExperimentResult:
@@ -206,6 +262,7 @@ def run_experiment(
         top_k: Top-k filtering parameter.
         verbose: Print per-token logs for each prompt.
         progress_fn: Optional callback(current, total) for progress updates.
+        timing_progress: If True, show tqdm progress with per-step timing breakdown.
         save_name: If set, save results to {results_dir}/{save_name}.json and .csv.
         results_dir: Directory to save results. Defaults to speculative-decoding/results/.
 
@@ -229,6 +286,10 @@ def run_experiment(
         verbose=verbose,
     )
 
+    progress_bar = None
+    if timing_progress and tqdm is not None:
+        progress_bar = tqdm(total=len(prompts), desc="SpecDec", unit="prompt", file=sys.stdout)
+
     for i, prompt in enumerate(prompts):
         # Run single prompt
         token_ids, output, stats = decoder.generate(prompt, max_new_tokens)
@@ -246,12 +307,26 @@ def run_experiment(
         result.total_rejected_tokens += stats.rejected_tokens
         result.total_draft_calls += stats.draft_calls
         result.total_target_calls += stats.target_calls
+        result.total_tokenization_time += stats.tokenization_time
         result.total_generation_time += stats.generation_time
+        result.total_decode_time += stats.decode_time
         result.total_tokens_generated += (stats.accepted_tokens + stats.rejected_tokens)
+
+        if progress_bar is not None:
+            progress_bar.set_postfix({
+                "tok": f"{stats.tokenization_time:.3f}s",
+                "infer": f"{stats.generation_time:.3f}s",
+                "decode": f"{stats.decode_time:.3f}s",
+                "total": f"{stats.total_time:.3f}s",
+            })
+            progress_bar.update(1)
 
         # Progress callback
         if progress_fn:
             progress_fn(i + 1, len(prompts))
+
+    if progress_bar is not None:
+        progress_bar.close()
 
     # Compute averages
     if result.total_prompts > 0:
@@ -295,6 +370,10 @@ def save_result_json(result: ExperimentResult, path: str | Path) -> None:
             "rejection_rate": result.rejection_rate,
             "throughput": result.throughput,
             "latency": result.latency,
+            "avg_tokenization_time": result.avg_tokenization_time,
+            "avg_generation_time": result.avg_generation_time,
+            "avg_decode_time": result.avg_decode_time,
+            "avg_prompt_time": result.avg_prompt_time,
             "target_calls": result.target_calls,
             "tokens_per_target_call": result.tokens_per_target_call,
         },
@@ -305,9 +384,13 @@ def save_result_json(result: ExperimentResult, path: str | Path) -> None:
             "total_rejected_tokens": result.total_rejected_tokens,
             "total_draft_calls": result.total_draft_calls,
             "total_target_calls": result.total_target_calls,
+            "total_tokenization_time": result.total_tokenization_time,
             "total_generation_time": result.total_generation_time,
+            "total_decode_time": result.total_decode_time,
+            "total_prompt_time": result.total_prompt_time,
             "total_tokens_generated": result.total_tokens_generated,
         },
+        "runtime_timings": result.runtime_timings,
         "prompts": [
             {
                 "prompt": pr.prompt,
@@ -317,7 +400,10 @@ def save_result_json(result: ExperimentResult, path: str | Path) -> None:
                 "rejected": pr.stats.rejected_tokens,
                 "draft_calls": pr.stats.draft_calls,
                 "target_calls": pr.stats.target_calls,
-                "time": pr.stats.generation_time,
+                "tokenization_time": pr.stats.tokenization_time,
+                "generation_time": pr.stats.generation_time,
+                "decode_time": pr.stats.decode_time,
+                "total_time": pr.stats.total_time,
             }
             for pr in result.prompt_results
         ],
@@ -341,7 +427,10 @@ def save_result_csv(result: ExperimentResult, path: str | Path) -> None:
         "acceptance_rate",
         "draft_calls",
         "target_calls",
+        "tokenization_time",
         "generation_time",
+        "decode_time",
+        "total_time",
     ]
 
     with open(path, "w", newline="") as f:
@@ -358,7 +447,10 @@ def save_result_csv(result: ExperimentResult, path: str | Path) -> None:
                 "acceptance_rate": f"{pr.stats.acceptance_rate:.4f}",
                 "draft_calls": pr.stats.draft_calls,
                 "target_calls": pr.stats.target_calls,
+                "tokenization_time": f"{pr.stats.tokenization_time:.4f}",
                 "generation_time": f"{pr.stats.generation_time:.4f}",
+                "decode_time": f"{pr.stats.decode_time:.4f}",
+                "total_time": f"{pr.stats.total_time:.4f}",
             })
 
 
