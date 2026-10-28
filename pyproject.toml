@@ -5,13 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "spec-decoding-implementation"
 version = "0.1.0"
-description = "Add your description here"
+description = "Dataset-independent speculative decoding harness"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate>=0.27",
-    "datasets>=2.14",
-    "pyyaml>=6.0",
     "torch>=2.0",
     "transformers>=4.40",
 ]
