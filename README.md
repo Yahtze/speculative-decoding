@@ -13,7 +13,9 @@ Standard autoregressive decoding generates one token at a time, making it bottle
    - `q(x)` = draft model probability for token x
 4. On rejection, resample from adjusted distribution `max(0, p(x) - q(x))`
 
-This produces **exact samples from the target distribution** while being significantly faster.
+With compatible tokenizers, this preserves the target sampling distribution. Speed depends on the models, acceptance rate, and implementation. This implementation recomputes forward passes for rejection and bonus sampling; measure speed rather than assume a speedup.
+
+The core module works with plain text prompts. Dataset loading, prompt formatting, and task-specific scoring belong in your own experiment code.
 
 ## Quick Start
 
@@ -24,9 +26,6 @@ uv sync
 # Run speculative decoding
 cd speculative-decoding
 uv run python -c "
-import sys
-sys.path.insert(0, 'src')
-
 from src.models import LanguageModel
 from src.decoding import SpeculativeDecoder
 
@@ -38,7 +37,7 @@ token_ids, text, stats = decoder.generate('The capital of France is', max_new_to
 
 print(f'OUTPUT: {text}')
 print(f'STATS:  {stats}')
-print(f'Acceptance rate: {stats.accepted_tokens / stats.drafted_tokens:.1%}')
+print(f'Acceptance rate: {stats.acceptance_rate:.1%}')
 "
 ```
 
@@ -47,6 +46,9 @@ print(f'Acceptance rate: {stats.accepted_tokens / stats.drafted_tokens:.1%}')
 ```
 speculative-decoding/
 ├── src/
+│   ├── benchmarks/
+│   │   ├── __init__.py
+│   │   └── runner.py          # Dataset-independent batch runner and result export
 │   ├── decoding/
 │   │   ├── __init__.py
 │   │   ├── greedy.py          # Greedy decoding baseline
@@ -58,13 +60,41 @@ speculative-decoding/
 │       └── wrapper.py         # LanguageModel/EmbeddingModel abstractions
 ├── tests/
 │   ├── test_greedy.py
+│   ├── test_models.py
+│   ├── test_runner.py         # Batch runner tests without model downloads
 │   ├── test_sampling.py
 │   └── test_speculative.py    # E2E tests for speculative decoding
-├── configs/
-├── data/
-├── report/
-└── results/
+└── results/                  # Created when saving batch results (ignored)
 ```
+
+## Run Your Own Prompts
+
+From `speculative-decoding/`, pass a list of prompts to the batch runner:
+
+```python
+from src.benchmarks import run_experiment
+from src.models import LanguageModel
+
+# Use models with the same tokenizer and vocabulary.
+draft = LanguageModel("HuggingFaceTB/SmolLM-135M")
+target = LanguageModel("HuggingFaceTB/SmolLM2-1.7B")
+
+result = run_experiment(
+    draft_model=draft,
+    target_model=target,
+    k=3,
+    prompts=["The capital of France is", "Explain how a compiler works."],
+    max_new_tokens=128,
+    save_name="custom_prompts",  # Writes results/custom_prompts.json and .csv
+)
+print(result.summary())
+```
+
+`src.benchmarks.load_prompts(path, format=...)` also reads JSONL objects with a `prompt`, `text`, or `input` field, text files with one prompt per line, and JSON arrays of strings. Supported formats are `jsonl` (default), `txt`, and `json`.
+
+The runner reports acceptance, throughput, latency, model calls, and timing data. Throughput counts emitted tokens, not prompt tokens or discarded drafts. Acceptance and rejection rates use all drafted tokens as the denominator. Add dataset-specific scoring outside the core module.
+
+The decoder requires matching token-to-ID vocabularies and EOS IDs. Empty encoded prompts raise `ValueError`. `k` and `top_k` must be positive integers; temperature must be finite and nonnegative. A temperature of zero selects greedy decoding.
 
 ## Core Components
 
@@ -78,7 +108,7 @@ class SpeculativeDecoder:
         target_model: LanguageModel,   # Large, accurate model
         k: int = 3,                    # Tokens to draft per round
         temperature: float = 1.0,      # Sampling temperature
-        top_k: int = 50,               # Top-k filtering
+        top_k: int = 50,               # Draft-only top-k filtering
         verbose: bool = False,         # Enable step-by-step logs
     )
 ```
@@ -95,9 +125,11 @@ class SpeculativeDecoder:
 @dataclass
 class DecodeStats:
     drafted_tokens: int   # Total tokens proposed by draft model
-    accepted_tokens: int  # Tokens accepted (matching or probabilistically)
-    rejected_tokens: int  # Tokens rejected
-    target_calls: int     # Number of target model forward passes
+    accepted_tokens: int  # Accepted draft tokens only
+    rejected_tokens: int  # All discarded drafts, including the suffix after rejection
+    generated_tokens: int # Emitted tokens, including replacements and bonus tokens
+    draft_calls: int      # Actual draft model forward passes
+    target_calls: int     # Actual target model forward passes
 ```
 
 ## Algorithm Details
@@ -110,7 +142,7 @@ For each draft token x with draft probability q(x) and target probability p(x):
 accept_ratio = min(1, p(x) / q(x))
 u ~ Uniform(0, 1)
 
-if u <= accept_ratio:
+if u < accept_ratio:
     accept token x
 else:
     reject and resample from adjusted distribution
@@ -124,11 +156,11 @@ When a token is rejected, we sample from:
 p'(x) = normalize(max(0, p(x) - q(x)))
 ```
 
-This ensures the overall distribution matches the target model exactly.
+Here `q` is the same temperature-scaled, top-k-filtered distribution used to propose draft tokens. The target distribution `p` uses temperature scaling but no top-k filter.
 
 ### Bonus Token
 
-When all K draft tokens are accepted, we sample one additional token from the target model to maintain the correct output length.
+When all draft tokens are accepted, we sample one additional token from the target model if the token budget permits it. Each draft block is capped by the remaining budget. Generation stops at EOS or `max_new_tokens`.
 
 ## Verbose Output
 
@@ -152,10 +184,20 @@ REJECTED: ' founded' (p=0.0486, q=0.0757, ratio=0.6419, u=0.8983)
 ----------------------------------------
 ```
 
+## Core Validation State
+
+**127 CPU tests passed**, with no failures, errors, skips, or expected failures. The original 40 tests also passed in both collection orders. Four focused proposal/residual checks passed across CPU and MPS.The tests cover greedy equivalence against causal tables and local/pretrained Hugging Face models, seeded sampling laws, top-k rejection residuals, token limits, EOS, tokenization, input safeguards, model-call counters, and result exports. These results apply to the tested settings. They do not establish a speedup or guarantee correctness for every model, device, or input. The tests and `validation/run.py` remain available to repeat validation with the command below.
+
 ## Running Tests
 
 ```bash
-# All tests
+# Full CPU validation suite (includes pretrained downloads)
+.venv/bin/python validation/run.py
+
+# Batch runner tests (no model downloads)
+uv run python speculative-decoding/tests/test_runner.py
+
+# Speculative decoding smoke tests (downloads a model)
 uv run python speculative-decoding/tests/test_speculative.py
 
 # Sampling tests
@@ -163,6 +205,9 @@ uv run python speculative-decoding/tests/test_sampling.py
 
 # Greedy tests
 uv run python speculative-decoding/tests/test_greedy.py
+
+# Model wrapper tests
+uv run python speculative-decoding/tests/test_models.py
 ```
 
 ## Dependencies

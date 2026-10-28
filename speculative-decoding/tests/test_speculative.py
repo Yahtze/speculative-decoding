@@ -6,6 +6,7 @@ Run: uv run python speculative-decoding/tests/test_speculative.py
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -64,7 +65,14 @@ def test_stats_are_consistent():
     target = LanguageModel(MODEL)
 
     decoder = SpeculativeDecoder(draft, target, k=3)
-    _, _, stats = decoder.generate("Once upon a time", max_new_tokens=30)
+    with (
+        patch.object(draft, "forward", wraps=draft.forward) as draft_forward,
+        patch.object(target, "forward", wraps=target.forward) as target_forward,
+    ):
+        token_ids, _, stats = decoder.generate("Once upon a time", max_new_tokens=30)
+    assert stats.draft_calls == draft_forward.call_count
+    assert stats.target_calls == target_forward.call_count
+    assert stats.generated_tokens == token_ids.numel() - draft.encode("Once upon a time").numel()
 
     assert stats.drafted_tokens >= 0, f"Negative drafted: {stats.drafted_tokens}"
     assert stats.accepted_tokens >= 0, f"Negative accepted: {stats.accepted_tokens}"
@@ -76,11 +84,6 @@ def test_stats_are_consistent():
     # drafted = accepted + rejected
     assert stats.drafted_tokens == stats.accepted_tokens + stats.rejected_tokens, (
         f"Drafted ({stats.drafted_tokens}) != accepted ({stats.accepted_tokens}) + rejected ({stats.rejected_tokens})"
-    )
-
-    # draft_calls == target_calls (each round has one of each, bonus adds to target)
-    assert stats.draft_calls <= stats.target_calls, (
-        f"draft_calls ({stats.draft_calls}) > target_calls ({stats.target_calls})"
     )
 
     # At least one call
@@ -144,8 +147,9 @@ def test_same_model_high_acceptance():
     print("=== test_same_model_high_acceptance ===")
     lm = LanguageModel(MODEL)
 
-    # Same model for both — acceptance ratio min(1, p/q) ≈ 1
-    decoder = SpeculativeDecoder(lm, lm, k=3, temperature=1.0)
+    # Full draft support makes p and q the same law. With top-k truncation,
+    # even a shared model can reject proposals and discard the draft suffix.
+    decoder = SpeculativeDecoder(lm, lm, k=3, temperature=1.0, top_k=lm.vocab_size)
     _, _, stats = decoder.generate("Hello", max_new_tokens=30)
 
     acceptance_rate = stats.accepted_tokens / max(stats.drafted_tokens, 1)
