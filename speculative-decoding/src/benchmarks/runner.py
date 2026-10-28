@@ -310,7 +310,7 @@ def run_experiment(
         result.total_tokenization_time += stats.tokenization_time
         result.total_generation_time += stats.generation_time
         result.total_decode_time += stats.decode_time
-        result.total_tokens_generated += (stats.accepted_tokens + stats.rejected_tokens)
+        result.total_tokens_generated += stats.generated_tokens
 
         if progress_bar is not None:
             progress_bar.set_postfix({
@@ -398,6 +398,7 @@ def save_result_json(result: ExperimentResult, path: str | Path) -> None:
                 "drafted": pr.stats.drafted_tokens,
                 "accepted": pr.stats.accepted_tokens,
                 "rejected": pr.stats.rejected_tokens,
+                "generated_tokens": pr.stats.generated_tokens,
                 "draft_calls": pr.stats.draft_calls,
                 "target_calls": pr.stats.target_calls,
                 "tokenization_time": pr.stats.tokenization_time,
@@ -424,6 +425,7 @@ def save_result_csv(result: ExperimentResult, path: str | Path) -> None:
         "drafted_tokens",
         "accepted_tokens",
         "rejected_tokens",
+        "generated_tokens",
         "acceptance_rate",
         "draft_calls",
         "target_calls",
@@ -444,6 +446,7 @@ def save_result_csv(result: ExperimentResult, path: str | Path) -> None:
                 "drafted_tokens": pr.stats.drafted_tokens,
                 "accepted_tokens": pr.stats.accepted_tokens,
                 "rejected_tokens": pr.stats.rejected_tokens,
+                "generated_tokens": pr.stats.generated_tokens,
                 "acceptance_rate": f"{pr.stats.acceptance_rate:.4f}",
                 "draft_calls": pr.stats.draft_calls,
                 "target_calls": pr.stats.target_calls,

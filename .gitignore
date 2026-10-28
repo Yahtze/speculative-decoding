@@ -15,3 +15,7 @@ scratchpad/
 
 # Experiment results
 speculative-decoding/results/
+
+# Generated validation evidence (summary and reproducers remain in source control)
+validation/*.log
+validation/*.xml

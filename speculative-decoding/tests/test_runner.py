@@ -7,6 +7,8 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER_PATH = ROOT / "src/benchmarks/runner.py"
@@ -17,6 +19,7 @@ class FakeDecodeStats:
     drafted_tokens: int = 0
     accepted_tokens: int = 0
     rejected_tokens: int = 0
+    generated_tokens: int = 0
     draft_calls: int = 0
     target_calls: int = 0
     generation_time: float = 0.0
@@ -39,6 +42,12 @@ class FakeDecodeStats:
             return 0.0
         return self.rejected_tokens / self.drafted_tokens
 
+    @property
+    def tokens_per_second(self) -> float:
+        if self.generation_time == 0:
+            return 0.0
+        return self.generated_tokens / self.generation_time
+
 
 class FakeSpeculativeDecoder:
     def __init__(self, *args, **kwargs):
@@ -50,6 +59,7 @@ class FakeSpeculativeDecoder:
             drafted_tokens=4,
             accepted_tokens=3,
             rejected_tokens=1,
+            generated_tokens=2,
             draft_calls=2,
             target_calls=2,
             generation_time=0.2,
@@ -64,44 +74,42 @@ class FakeLanguageModel:
         return "FakeLanguageModel()"
 
 
-def load_runner_module():
+def load_runner_module(monkeypatch: pytest.MonkeyPatch):
     src_pkg = types.ModuleType("src")
     src_pkg.__path__ = [str(ROOT / "src")]
-    sys.modules["src"] = src_pkg
+    monkeypatch.setitem(sys.modules, "src", src_pkg)
 
     benchmarks_pkg = types.ModuleType("src.benchmarks")
     benchmarks_pkg.__path__ = [str(ROOT / "src/benchmarks")]
-    sys.modules["src.benchmarks"] = benchmarks_pkg
+    monkeypatch.setitem(sys.modules, "src.benchmarks", benchmarks_pkg)
 
     models_pkg = types.ModuleType("src.models")
     models_pkg.__path__ = [str(ROOT / "src/models")]
-    sys.modules["src.models"] = models_pkg
+    monkeypatch.setitem(sys.modules, "src.models", models_pkg)
 
     wrapper_mod = types.ModuleType("src.models.wrapper")
     wrapper_mod.LanguageModel = FakeLanguageModel
-    sys.modules["src.models.wrapper"] = wrapper_mod
+    monkeypatch.setitem(sys.modules, "src.models.wrapper", wrapper_mod)
 
     decoding_pkg = types.ModuleType("src.decoding")
     decoding_pkg.__path__ = [str(ROOT / "src/decoding")]
-    sys.modules["src.decoding"] = decoding_pkg
+    monkeypatch.setitem(sys.modules, "src.decoding", decoding_pkg)
 
     speculative_mod = types.ModuleType("src.decoding.speculative")
     speculative_mod.SpeculativeDecoder = FakeSpeculativeDecoder
     speculative_mod.DecodeStats = FakeDecodeStats
-    sys.modules["src.decoding.speculative"] = speculative_mod
+    monkeypatch.setitem(sys.modules, "src.decoding.speculative", speculative_mod)
 
     spec = importlib.util.spec_from_file_location("src.benchmarks.runner", RUNNER_PATH)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["src.benchmarks.runner"] = module
+    monkeypatch.setitem(sys.modules, "src.benchmarks.runner", module)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-runner = load_runner_module()
-
-
-def test_run_experiment_aggregates_timing_fields():
+def test_run_experiment_aggregates_timing_fields(monkeypatch):
+    runner = load_runner_module(monkeypatch)
     result = runner.run_experiment(
         draft_model=FakeLanguageModel(),
         target_model=FakeLanguageModel(),
@@ -111,6 +119,9 @@ def test_run_experiment_aggregates_timing_fields():
     )
 
     assert result.total_prompts == 2
+    assert result.total_tokens_generated == 4
+    assert result.prompt_results[0].stats.generated_tokens == 2
+    assert result.prompt_results[0].stats.tokens_per_second == 10.0
     assert result.total_tokenization_time == 0.1
     assert result.total_decode_time == 0.02
     assert result.total_prompt_time == 0.52
@@ -125,7 +136,8 @@ def test_run_experiment_aggregates_timing_fields():
     assert "Avg total/prompt:" in summary
 
 
-def test_save_result_json_includes_timing_breakdown(tmp_path: Path):
+def test_save_result_json_includes_timing_breakdown(tmp_path: Path, monkeypatch):
+    runner = load_runner_module(monkeypatch)
     result = runner.run_experiment(
         draft_model=FakeLanguageModel(),
         target_model=FakeLanguageModel(),
@@ -151,6 +163,7 @@ def test_save_result_json_includes_timing_breakdown(tmp_path: Path):
     assert data["metrics"]["avg_prompt_time"] == 0.26
     assert data["totals"]["total_tokenization_time"] == 0.05
     assert data["totals"]["total_decode_time"] == 0.01
+    assert data["totals"]["total_tokens_generated"] == 2
     assert data["runtime_timings"]["dataset_load_time"] == 1.25
     assert data["runtime_timings"]["draft_model_load_time"] == 2.5
     assert data["runtime_timings"]["target_model_load_time"] == 3.75
@@ -160,9 +173,15 @@ def test_save_result_json_includes_timing_breakdown(tmp_path: Path):
     assert data["prompts"][0]["generation_time"] == 0.2
     assert data["prompts"][0]["decode_time"] == 0.01
     assert data["prompts"][0]["total_time"] == 0.26
+    assert data["prompts"][0]["generated_tokens"] == 2
+
+    csv_out = tmp_path / "result.csv"
+    runner.save_result_csv(result, csv_out)
+    import csv
+    with csv_out.open(newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["generated_tokens"] == "2"
 
 
 if __name__ == "__main__":
-    test_run_experiment_aggregates_timing_fields()
-    test_save_result_json_includes_timing_breakdown(Path("/tmp"))
-    print("All tests passed!")
+    raise SystemExit(pytest.main([__file__]))

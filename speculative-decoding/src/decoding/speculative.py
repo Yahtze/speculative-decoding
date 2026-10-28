@@ -11,6 +11,7 @@ Repeats until EOS.
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ class DecodeStats:
     rejected_tokens: int = 0
     draft_calls: int = 0
     target_calls: int = 0
+    generated_tokens: int = 0
     tokenization_time: float = 0.0
     generation_time: float = 0.0
     decode_time: float = 0.0
@@ -58,10 +60,10 @@ class DecodeStats:
 
     @property
     def tokens_per_second(self) -> float:
-        """Tokens generated per second (including prompt)."""
+        """Emitted new tokens per second (excluding the prompt)."""
         if self.generation_time == 0:
             return 0.0
-        return (self.accepted_tokens + self.rejected_tokens) / self.generation_time
+        return self.generated_tokens / self.generation_time
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +111,66 @@ class SpeculativeDecoder:
 
     # -- helpers ------------------------------------------------------------
 
+    @staticmethod
+    def _model_vocab_size(model: LanguageModel) -> int:
+        size = getattr(model, "vocab_size", None)
+        if size is None:
+            raise ValueError("Model must expose its vocabulary size")
+        return int(size)
+
+    def _validate_inputs(self, max_new_tokens: int) -> None:
+        """Reject unsupported options and incompatible tokenizer/model pairs."""
+        if isinstance(self.k, bool) or not isinstance(self.k, int) or self.k <= 0:
+            raise ValueError("k must be a positive integer")
+        if isinstance(self.top_k, bool) or not isinstance(self.top_k, int) or self.top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
+        try:
+            valid_temperature = (
+                isinstance(self.temperature, (int, float))
+                and math.isfinite(self.temperature)
+                and self.temperature >= 0
+            )
+        except (OverflowError, TypeError):
+            valid_temperature = False
+        if not valid_temperature:
+            raise ValueError("temperature must be finite and non-negative")
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a non-negative integer")
+
+        draft_vocab = self._model_vocab_size(self.draft_model)
+        target_vocab = self._model_vocab_size(self.target_model)
+        if draft_vocab != target_vocab:
+            raise ValueError("Draft and target model vocabulary sizes must match")
+        draft_tokenizer = getattr(self.draft_model, "tokenizer", None)
+        target_tokenizer = getattr(self.target_model, "tokenizer", None)
+        if draft_tokenizer is None or target_tokenizer is None:
+            raise ValueError("Draft and target models must provide tokenizers")
+        if draft_tokenizer.eos_token_id != target_tokenizer.eos_token_id:
+            raise ValueError("Draft and target tokenizer EOS token IDs must match")
+        if hasattr(draft_tokenizer, "get_vocab") and hasattr(target_tokenizer, "get_vocab"):
+            if draft_tokenizer.get_vocab() != target_tokenizer.get_vocab():
+                raise ValueError("Draft and target tokenizer token-to-ID mappings must match")
+        eos_id = draft_tokenizer.eos_token_id
+        if eos_id is not None and not 0 <= eos_id < draft_vocab:
+            raise ValueError("EOS token ID is outside the model vocabulary")
+
+    def _distribution_from_logits(
+        self, logits: torch.Tensor, *, top_k: bool = False
+    ) -> torch.Tensor:
+        """Convert logits to probabilities with the exact proposal filter."""
+        if logits.dtype in (torch.float16, torch.bfloat16) or not logits.is_floating_point():
+            logits = logits.to(torch.float32)
+        if top_k:
+            values = torch.topk(logits, min(self.top_k, logits.shape[-1]), dim=-1).values
+            threshold = values[..., -1:]
+            logits = logits.masked_fill(logits < threshold, -torch.inf)
+        if self.temperature == 0.0:
+            probs = torch.zeros_like(logits)
+            probs.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+            return probs
+        scaled = (logits - logits.max(dim=-1, keepdim=True).values) / self.temperature
+        return torch.softmax(scaled, dim=-1)
+
     def _top_k_sample_with_probs(
         self, model: LanguageModel, input_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -121,35 +183,17 @@ class SpeculativeDecoder:
             - token_prob: scalar tensor with the probability of the sampled token.
         """
         output = model.forward(input_ids)
-        logits = output.logits[:, -1, :]  # (1, vocab_size)
+        logits = output.logits[:, -1, :].clone()  # (1, vocab_size)
+        if logits.shape[-1] != self._model_vocab_size(model):
+            raise ValueError("Model output vocabulary size does not match its tokenizer/model")
 
-        # Mask to top-k
-        top_k_vals, _ = torch.topk(logits, self.top_k, dim=-1)
-        threshold = top_k_vals[:, -1].unsqueeze(-1)
-        mask = logits < threshold
-        logits[mask] = float("-inf")
-
-        # Greedy mode: argmax instead of sampling
-        if self.temperature == 0.0:
-            next_token = logits.argmax(dim=-1, keepdim=True)  # (1, 1)
-            # One-hot probability for greedy token
-            probs = torch.zeros_like(logits)
-            probs[0, next_token.item()] = 1.0
-            token_prob = probs[0, next_token.item()]
-            return next_token, token_prob
-
-        # Scale and convert to probabilities
-        scaled = logits / self.temperature
-        probs = torch.softmax(scaled, dim=-1)  # (1, vocab_size)
-
-        # Sample
-        next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
-        token_prob = probs[0, next_token.item()]  # scalar
-
+        probs = self._distribution_from_logits(logits, top_k=True)
+        next_token = torch.multinomial(probs, num_samples=1)
+        token_prob = probs[0, next_token.item()]
         return next_token, token_prob
 
     def _get_probs(
-        self, model: LanguageModel, input_ids: torch.Tensor
+        self, model: LanguageModel, input_ids: torch.Tensor, *, top_k: bool = False
     ) -> torch.Tensor:
         """
         Get the full probability distribution over the vocabulary for the last position.
@@ -158,17 +202,11 @@ class SpeculativeDecoder:
             probs: (1, vocab_size) probability distribution.
         """
         output = model.forward(input_ids)
-        logits = output.logits[:, -1, :]  # (1, vocab_size)
+        logits = output.logits[:, -1, :].clone()  # (1, vocab_size)
+        if logits.shape[-1] != self._model_vocab_size(model):
+            raise ValueError("Model output vocabulary size does not match its tokenizer/model")
 
-        # Greedy mode: one-hot on argmax
-        if self.temperature == 0.0:
-            probs = torch.zeros_like(logits)
-            probs[0, logits.argmax(dim=-1)] = 1.0
-            return probs
-
-        scaled = logits / self.temperature
-        probs = torch.softmax(scaled, dim=-1)
-        return probs
+        return self._distribution_from_logits(logits, top_k=top_k)
 
     def _decode_token(self, model: LanguageModel, token_id: int) -> str:
         """Decode a single token id to its string representation."""
@@ -186,6 +224,7 @@ class SpeculativeDecoder:
         self,
         input_ids: torch.Tensor,
         eos_token_id: int | None,
+        max_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Draft phase: run the small model autoregressively for k tokens.
@@ -204,7 +243,7 @@ class SpeculativeDecoder:
         draft_probs: list[torch.Tensor] = []
         current_ids = input_ids.clone()
 
-        for _ in range(self.k):
+        for _ in range(min(self.k, max_tokens) if max_tokens is not None else self.k):
             next_token, token_prob = self._top_k_sample_with_probs(
                 self.draft_model, current_ids
             )
@@ -248,6 +287,8 @@ class SpeculativeDecoder:
         """
         output = self.target_model.forward(extended_input_ids)
         logits = output.logits  # (1, seq_len + num_drafted, vocab_size)
+        if logits.shape[-1] != self._model_vocab_size(self.draft_model):
+            raise ValueError("Draft and target model output vocabulary sizes must match")
 
         original_len = extended_input_ids.shape[1] - num_drafted
 
@@ -260,25 +301,10 @@ class SpeculativeDecoder:
 
             draft_tok = drafted_ids[0, i].item()
 
-            # Greedy mode: one-hot on argmax
-            if self.temperature == 0.0:
-                probs = torch.zeros_like(pos_logits)
-                argmax_tok = pos_logits.argmax(dim=-1, keepdim=True)
-                probs[0, argmax_tok.item()] = 1.0
-                target_prob = probs[0, draft_tok]
-                target_probs.append(target_prob)
-                target_token_ids.append(argmax_tok)
-                continue
-
-            scaled = pos_logits / self.temperature
-            probs = torch.softmax(scaled, dim=-1)  # (1, vocab_size)
-
-            target_prob = probs[0, draft_tok]  # p(x) for the draft token
+            probs = self._distribution_from_logits(pos_logits)
+            target_prob = probs[0, draft_tok]
             target_probs.append(target_prob)
-
-            # Also get argmax for logging
-            argmax_tok = probs.argmax(dim=-1, keepdim=True)  # (1, 1)
-            target_token_ids.append(argmax_tok)
+            target_token_ids.append(probs.argmax(dim=-1, keepdim=True))
 
         target_probs_tensor = torch.stack(target_probs)  # (num_drafted,)
         target_ids = torch.cat(target_token_ids, dim=-1)  # (1, num_drafted)
@@ -317,7 +343,9 @@ class SpeculativeDecoder:
             (new_input_ids, hit_eos, num_accepted, num_rejected)
         """
         num_drafted = drafted_ids.shape[1]
+        self._last_rejection_resampled = False
         accepted_tokens: list[torch.Tensor] = []
+        accepted_draft_count = 0
         hit_eos = False
 
         for i in range(num_drafted):
@@ -333,9 +361,10 @@ class SpeculativeDecoder:
 
             u = torch.rand(1).item()
 
-            if u <= accept_ratio:
+            if u < accept_ratio:
                 # Accept the draft token
                 accepted_tokens.append(drafted_ids[0, i : i + 1])
+                accepted_draft_count += 1
                 self._log(
                     f"ACCEPTED: {self._decode_token(self.draft_model, draft_tok)!r} "
                     f"(p={p_x:.4f}, q={q_x:.4f}, ratio={accept_ratio:.4f}, u={u:.4f})"
@@ -351,6 +380,7 @@ class SpeculativeDecoder:
                 )
 
                 # Get full target distribution and resample
+                self._last_rejection_resampled = True
                 resampled_token = self._resample_rejected(input_ids, accepted_tokens, eos_token_id)
                 accepted_tokens.append(resampled_token)
 
@@ -361,7 +391,8 @@ class SpeculativeDecoder:
                     hit_eos = True
                 break
 
-        num_accepted = len(accepted_tokens)
+        # Replacement output is emitted, but is not an accepted draft.
+        num_accepted = accepted_draft_count
         num_rejected = num_drafted - num_accepted
 
         if accepted_tokens:
@@ -385,9 +416,8 @@ class SpeculativeDecoder:
         The adjusted distribution is: p'(x) = norm(max(0, p(x) - q(x)))
         where p(x) is the target distribution and q(x) is the draft distribution.
 
-        If we have no accepted tokens yet, we just sample from the target distribution
-        at the current position. Otherwise, we need to construct the sequence with
-        accepted tokens appended and sample from there.
+        The sequence is constructed from the original prompt and accepted draft
+        prefix; the same filtered draft proposal law is used at that position.
         """
         # Build the sequence up to the rejection point
         if accepted_tokens:
@@ -400,7 +430,9 @@ class SpeculativeDecoder:
         target_probs = self._get_probs(self.target_model, current_ids)  # (1, vocab_size)
 
         # Get draft distribution at the current position
-        draft_probs = self._get_probs(self.draft_model, current_ids)  # (1, vocab_size)
+        draft_probs = self._get_probs(
+            self.draft_model, current_ids, top_k=True
+        )  # Same truncated, temperature-scaled law used for proposals.
 
         # Adjusted distribution: max(0, p(x) - q(x))
         adjusted = torch.clamp(target_probs - draft_probs, min=0.0)  # (1, vocab_size)
@@ -454,12 +486,22 @@ class SpeculativeDecoder:
             (token_ids, decoded_text, stats)
         """
         stats = DecodeStats()
+        self._validate_inputs(max_new_tokens)
         eos_token_id = self.draft_model.tokenizer.eos_token_id
 
         # Encode prompt (use draft model's tokenizer — both should share vocab)
         tokenization_start = time.perf_counter()
         input_ids = self.draft_model.encode(prompt)  # (1, seq_len)
+        if not isinstance(input_ids, torch.Tensor):
+            raise ValueError("Prompt encoding must return a tensor of token IDs")
+        if input_ids.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+            raise ValueError("Prompt encoding must contain integer token IDs")
         stats.tokenization_time = time.perf_counter() - tokenization_start
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+            raise ValueError("Prompt must encode to a non-empty token sequence/context")
+        vocab_size = self._model_vocab_size(self.draft_model)
+        if torch.any(input_ids < 0) or torch.any(input_ids >= vocab_size):
+            raise ValueError("Prompt contains token IDs outside the model vocabulary")
         original_len = input_ids.shape[1]
 
         self._log(f"PROMPT:   {prompt!r}")
@@ -471,12 +513,13 @@ class SpeculativeDecoder:
 
         while total_generated < max_new_tokens and not hit_eos:
             # 1. Draft
+            remaining = max_new_tokens - total_generated
             drafted_ids, extended_input_ids, draft_probs = self.draft_step(
-                input_ids, eos_token_id
+                input_ids, eos_token_id, max_tokens=remaining
             )
             num_drafted = drafted_ids.shape[1]
             stats.drafted_tokens += num_drafted
-            stats.draft_calls += 1
+            stats.draft_calls += num_drafted
 
             # 2. Verify (one target call per round)
             target_probs, target_ids = self.verify_step(
@@ -490,7 +533,12 @@ class SpeculativeDecoder:
             )
             stats.accepted_tokens += num_accepted
             stats.rejected_tokens += num_rejected
+            if self._last_rejection_resampled:
+                # Rejection resampling makes one target and one draft forward.
+                stats.target_calls += 1
+                stats.draft_calls += 1
             total_generated = input_ids.shape[1] - original_len
+            stats.generated_tokens = total_generated
 
             # 4. If all K tokens accepted and no EOS, sample bonus token from target
             if num_accepted == num_drafted and not hit_eos and total_generated < max_new_tokens:
@@ -498,6 +546,7 @@ class SpeculativeDecoder:
                 input_ids = torch.cat([input_ids, bonus_token], dim=-1)
                 total_generated += 1
                 stats.target_calls += 1
+                stats.generated_tokens += 1
 
                 bonus_text = self._decode_token(self.target_model, bonus_token.item())
                 self._log(f"BONUS:    {bonus_text!r} (from target)")
